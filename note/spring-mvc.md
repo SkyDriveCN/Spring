@@ -1188,3 +1188,256 @@ HandlerMethodReturnValueHandler接口以及主要实现类如下:
 从中也可以推测出我们可以把哪些类型的值(对象)直接"丢给"Spring。
 
 对于HandlerMethodArgumentResolver和HandlerMethodReturnValueHandler来说，HttpMessageConverter像是两者手中用来实现功能的武器。
+
+## "纯"对象参数接收
+
+假设有如下这样的Controller:
+
+```java
+@RequestMapping("/echoAgain")
+public String echo(SimpleModel simpleModel, Model model) {
+    model.addAttribute("echo", "hello " + simpleModel.getName() + ", your age is " + simpleModel.getAge() + ".");
+    return "echo";
+}
+```
+
+经过测试可以发现，SimpleModel参数既可以接收get请求，也可以接收post请求。那么在这种情况下请求参数是被哪个参数解析器解析的呢，debug发现: ServletModelAttributeMethodProcessor：
+
+![ServletModelAttributeMethodProcessor](images/ServletModelAttributeMethodProcessor.jpg)
+
+核心的supportsParameter方法由父类ModelAttributeMethodProcessor实现:
+
+```java
+@Override
+public boolean supportsParameter(MethodParameter parameter) {
+    return (parameter.hasParameterAnnotation(ModelAttribute.class) ||
+        (this.annotationNotRequired && !BeanUtils.isSimpleProperty(parameter.getParameterType())));
+}
+```
+
+可以看出，这里支持带有ModelAttribute注解或者是非基本类型的参数解析，同时annotationNotRequired必须设为false，即ModelAttribute注解不必存在，这里是在ServletModelAttributeMethodProcessor的构造器中进行控制的，
+RequestMappingHandlerAdapter.getDefaultArgumentResolvers部分源码:
+
+```java
+resolvers.add(new ServletModelAttributeMethodProcessor(false));
+```
+
+此类的作用是对@ModelAttribute注解标注的参数进行解析，假设我们将Controller方法改写成:
+
+```java
+@RequestMapping("/echoAgain")
+public String echo(@ModelAttribute SimpleModel simpleModel, Model model) {
+    model.addAttribute("echo", "hello " + simpleModel.getName() + ", your age is " + simpleModel.getAge() + ".");
+    System.out.println(model.asMap().get("simpleModel"));
+    return "echo";
+}
+```
+
+首先，Spring会首先反射生成一个SimpleModel对象，之后将从request中获取的参数尝试设置到SimpleModel对象中去，最后将此对象放置到Model中(本质上就是一个Map)，key就是simpleModel.下面我们来看一下具体的解析过程，整个过程可以分为
+以下三部分:
+
+### 参数对象构造
+
+因为SimpleModel是一个对象类型，所以要想将参数注入到其中，第一步必然是先创建一个对象，创建的入口位于ModelAttributeMethodProcessor的resolveArgument方法，相关源码:
+
+```java
+//name在这里便是simpleModel
+String name = ModelFactory.getNameForParameter(parameter);
+Object attribute = (mavContainer.containsAttribute(name) ? mavContainer.getModel().get(name) :
+                    createAttribute(name, parameter, binderFactory, webRequest));//反射实例化
+```
+
+ModelAndViewContainer是个什么东西呢，从名字就可以看出就，它是Spring MVC里两个重要概念Model和View的组合体，用来记录在请求响应过程中Model和View的变化，在这里可以简单理解为去Model中检查有没有叫simpleModel的属性已经存在。
+
+### 参数绑定
+
+这里使用到了DataBinder接口，按照注释的说明，此接口用以**向执行的对象中设置属性值**，就是这么简单，其继承体系如下图:
+
+![DataBinder](images/DataBinder.jpg)
+
+WebDataBinderFactory接口用以创建WebDataBinder对象，其继承体系如下图:
+
+![WebDataBinderFactory](images/WebDataBinderFactory.jpg)
+
+默认使用的是ServletRequestDataBinderFactory，创建了一个ExtendedServletRequestDataBinder对象:
+
+```java
+@Override
+protected ServletRequestDataBinder createBinderInstance(Object target, String objectName, NativeWebRequest request) {
+    return new ExtendedServletRequestDataBinder(target, objectName);
+}
+```
+
+参数绑定的入口位于ModelAttributeMethodProcessor.resolveArgument方法，相关源码:
+
+```java
+if (!mavContainer.isBindingDisabled(name)) {
+    bindRequestParameters(binder, webRequest);
+}
+```
+
+接下来由ServletRequestDataBinder的bind方法完成，核心源码:
+
+```java
+public void bind(ServletRequest request) {
+    MutablePropertyValues mpvs = new ServletRequestParameterPropertyValues(request);
+    doBind(mpvs);
+}
+```
+
+在ServletRequestParameterPropertyValues构造器中获取了Request中所有的属性对。doBind方法便是调用前面初始化的目标对象的setter方法进行参数设置的过程，不再展开。
+
+### 参数校验
+
+将我们的Controller方法改写为下面这种形式便可以启动Spring MVC的参数校验:
+
+```java
+@RequestMapping("/echoAgain")
+public String echo(@Validated SimpleModel simpleModel, Model model) {
+    model.addAttribute("echo", "hello " + simpleModel.getName() + ", your age is " + simpleModel.getAge() + ".");
+    System.out.println(model.asMap().get("simpleModel"));
+    return "echo";
+}
+```
+
+在这里@Validated注解可以用@Valid(javax)替换，前者是Spring对java校验标准的扩充，增加了校验组的支持。
+为什么参数校验要放到参数绑定后面进行说明呢，因为**@Validated和@valid注解不会影响Spring MVC参数解析的行为，被这两个注解标注的对象仍是由参数绑定一节提到的解析器进行解析。**
+
+当参数校验绑定之后，Spring MVC会尝试对参数进行校验，如果我们设置了校验注解。ModelAttributeMethodProcessor.resolveArgument方法相关源码:
+
+```java
+validateIfApplicable(binder, parameter);
+
+protected void validateIfApplicable(WebDataBinder binder, MethodParameter methodParam) {
+    Annotation[] annotations = methodParam.getParameterAnnotations();
+    for (Annotation ann : annotations) {
+        Validated validatedAnn = AnnotationUtils.getAnnotation(ann, Validated.class);
+        if (validatedAnn != null || ann.annotationType().getSimpleName().startsWith("Valid")) {
+            Object hints = (validatedAnn != null ? validatedAnn.value() : AnnotationUtils.getValue(ann));
+            Object[] validationHints = (hints instanceof Object[] ? (Object[]) hints : new Object[] {hints});
+            binder.validate(validationHints);
+            break;
+        }
+    }
+}
+```
+
+DataBinder.validate:
+
+```java
+public void validate(Object... validationHints) {
+    for (Validator validator : getValidators()) {
+        if (!ObjectUtils.isEmpty(validationHints) && validator instanceof SmartValidator) {
+            ((SmartValidator) validator).validate(getTarget(), getBindingResult(), validationHints);
+        } else if (validator != null) {
+            validator.validate(getTarget(), getBindingResult());
+        }
+    }
+}
+```
+
+可见，具体的校验交给了`org.springframework.validation.Validator`实现，类图:
+
+![Validator](images/Validator.png)
+
+getValidators方法获取的实际上是DataBinder内部的validators字段:
+
+```java
+private final List<Validator> validators = new ArrayList<Validator>();
+```
+
+根据这里的校验器的来源可以分为以下两种情况。
+
+#### JSR校验
+
+需要引入hibernate-validator到classpath中，回顾最前面配置解析部分，配置:
+
+```xml
+<mvc:annotation-driven/>
+```
+
+会利用AnnotationDrivenBeanDefinitionParser进行相关的解析、初始化工作，正是在其parse方法完成了对JSR校验的支持。相关源码:
+
+```java
+@Override
+public BeanDefinition parse(Element element, ParserContext parserContext) {
+    RuntimeBeanReference validator = getValidator(element, source, parserContext);
+}
+
+private RuntimeBeanReference getValidator(Element element, Object source, ParserContext parserContext) {
+    //mvc:annotation-driven配置支持validator属性
+    if (element.hasAttribute("validator")) {
+        return new RuntimeBeanReference(element.getAttribute("validator"));
+    } else if (javaxValidationPresent) {
+        RootBeanDefinition validatorDef = new RootBeanDefinition(
+                "org.springframework.validation.beanvalidation.OptionalValidatorFactoryBean");
+        validatorDef.setSource(source);
+        validatorDef.setRole(BeanDefinition.ROLE_INFRASTRUCTURE);
+        String validatorName = parserContext.getReaderContext().registerWithGeneratedName(validatorDef);
+        parserContext.registerComponent(new BeanComponentDefinition(validatorDef, validatorName));
+        return new RuntimeBeanReference(validatorName);
+    } else {
+        return null;
+    }
+}
+```
+
+javaxValidationPresent的定义:
+
+```java
+private static final boolean javaxValidationPresent =
+    ClassUtils.isPresent("javax.validation.Validator", AnnotationDrivenBeanDefinitionParser.class.getClassLoader());
+```
+
+ 实现了InitializingBean接口，所以afterPropertiesSet方法是其初始化的入口，具体的校验过程不再展开。
+ 除此之外还有一个有意思的问题，就是上面提到的校验器是如何进入到DataBinder中去的呢?答案是WebDataBinderFactory创建DataBinder对象时会利用WebBindingInitializer对DataBinder进行初始化，正是在这里
+ 将容器中存在的校验器设置到DataBinder中，至于WebBindingInitializer又是从哪里来的，不再探究了，否则这细节实在是太麻烦了，意义不大。
+
+#### 自定义校验器
+
+我们可以实现Spring提供的Validator接口，然后在Controller里边这样设置我们要是用的校验器:
+
+```java
+@InitBinder
+public void initBinder(DataBinder dataBinder) {
+    dataBinder.setValidator(new SimpleModelValidator());
+    //如果有多个可以使用addValidators方法
+}
+```
+
+我们的Controller方法依然可以如此定义:
+
+```java
+@RequestMapping("/echoAgain")
+public String echo(@Validated SimpleModel simpleModel, Model model) {
+    return "echo";
+}
+```
+
+如果有错误，会直接返回400.
+
+#### 一个有意思的问题
+
+如果我们把Controller方法这样定义会怎样?
+
+```java
+@RequestMapping(value = "/echoAgain", method = RequestMethod.POST)
+public String echo(@Validated @RequestBody SimpleModel simpleModel, Model model) {}
+```
+
+答案是@RequestBody注解先于@Validated注解起作用，这样既可以利用@RequestBody注解向Controller传递json串，同时又能够达到校验的目的。从源码的角度来说，这在很大程度上是一个顺序的问题:
+RequestMappingHandlerAdapter.getDefaultArgumentResolvers相关源码:
+
+```java
+resolvers.add(new ServletModelAttributeMethodProcessor(false));
+resolvers.add(new RequestResponseBodyMethodProcessor(getMessageConverters(), this.requestResponseBodyAdvice));
+```
+
+虽然ServletModelAttributeMethodProcessor位于RequestResponseBodyMethodProcessor之前，但构造器参数为false说明了此解析器必须要求参数被@ModelAttribute注解标注，其实在最后还有一个不需要注解的解析器被添加:
+
+```java
+// Catch-all
+resolvers.add(new ServletModelAttributeMethodProcessor(true));
+```
+
+至此，真相大白。
